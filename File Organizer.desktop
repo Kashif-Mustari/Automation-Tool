@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=File Organizer
+Comment=Organize files into folders with one click
+Exec=python3 /home/kashifmustari/Desktop/Web/Automation-Tool/organizer.py
+Path=/home/kashifmustari/Desktop/Web/Automation-Tool
+Terminal=false
+Categories=Utility;
