@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import os
 import shutil
 import tkinter as tk
 from pathlib import Path
@@ -21,59 +20,78 @@ FILE_TYPES = {
     "Apps": [".exe", ".msi", ".appimage", ".deb"],
 }
 
+ALL_CATEGORIES = list(FILE_TYPES.keys()) + ["Others"]
+
 
 def get_folder_for_file(filename):
-    _, ext = os.path.splitext(filename)
-    ext = ext.lower()
+    extension = Path(filename).suffix.lower()
 
     for folder, extensions in FILE_TYPES.items():
-        if ext in extensions:
+        if extension in extensions:
             return folder
     return "Others"
 
 
-def get_unique_destination(file_path, destination_folder):
-    filename = os.path.basename(file_path)
-    destination_path = os.path.join(destination_folder, filename)
+def is_hidden_path(path):
+    return any(part.startswith(".") for part in Path(path).parts)
 
+
+def get_unique_destination(source_path, destination_folder, dry_run=False):
+    destination_folder = Path(destination_folder)
+    if not dry_run:
+        destination_folder.mkdir(parents=True, exist_ok=True)
+
+    filename = Path(source_path).name
+    destination_path = destination_folder / filename
     counter = 1
-    while os.path.exists(destination_path):
-        name, ext = os.path.splitext(filename)
-        new_name = f"{name}_{counter}{ext}"
-        destination_path = os.path.join(destination_folder, new_name)
+
+    while destination_path.exists():
+        stem = destination_path.stem
+        suffix = destination_path.suffix
+        destination_path = destination_folder / f"{stem}_{counter}{suffix}"
         counter += 1
 
     return destination_path
 
 
-def move_file(file_path, destination_folder):
-    os.makedirs(destination_folder, exist_ok=True)
-    destination_path = get_unique_destination(file_path, destination_folder)
-    shutil.move(file_path, destination_path)
-    return destination_path
-
-
-def organize_folder(folder_path):
-    if not os.path.isdir(folder_path):
+def organize_folder(source_folder, destination_folder=None, recursive=False, dry_run=False):
+    source = Path(source_folder)
+    if not source.is_dir():
         raise FileNotFoundError("Selected folder does not exist.")
 
+    destination = Path(destination_folder) if destination_folder else source
+    if destination.resolve() != source.resolve() and destination.resolve().is_relative_to(source.resolve()):
+        raise ValueError("Destination must not be a subfolder of the source folder.")
+
+    paths = list(source.rglob("*") if recursive else source.iterdir())
     moved_files = []
     errors = []
 
-    for item in os.listdir(folder_path):
-        item_path = os.path.join(folder_path, item)
-
-        if not os.path.isfile(item_path) or item.startswith("."):
+    for item in paths:
+        if item.is_dir():
             continue
 
-        target_folder = get_folder_for_file(item)
-        destination_folder = os.path.join(folder_path, target_folder)
+        if is_hidden_path(item):
+            continue
+
+        if destination.resolve() != source.resolve() and destination.resolve() in item.resolve().parents:
+            continue
+
+        if destination.resolve() == source.resolve():
+            first_part = item.relative_to(source).parts[0]
+            if first_part in ALL_CATEGORIES:
+                continue
+
+        category = get_folder_for_file(item.name)
+        target_folder = destination / category
 
         try:
-            destination_path = move_file(item_path, destination_folder)
-            moved_files.append((item, target_folder, os.path.basename(destination_path)))
+            destination_path = get_unique_destination(item, target_folder, dry_run=dry_run)
+            if not dry_run:
+                shutil.move(str(item), str(destination_path))
+            moved_files.append((str(item), category, destination_path.name))
         except OSError as error:
-            errors.append((item, str(error)))
+            errors.append((str(item), str(error)))
 
     return moved_files, errors
 
@@ -82,11 +100,15 @@ class FileOrganizerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("One Click File Organizer")
-        self.root.geometry("720x480")
-        self.root.minsize(620, 420)
+        self.root.geometry("820x560")
+        self.root.minsize(720, 500)
 
         self.folder_var = tk.StringVar(value=DEFAULT_SOURCE_FOLDER)
+        self.destination_var = tk.StringVar(value=DEFAULT_SOURCE_FOLDER)
         self.status_var = tk.StringVar(value="Ready")
+        self.summary_var = tk.StringVar(value="")
+        self.recursive_var = tk.BooleanVar(value=False)
+        self.dry_run_var = tk.BooleanVar(value=False)
 
         self.setup_styles()
         self.build_ui()
@@ -95,11 +117,14 @@ class FileOrganizerApp:
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("TFrame", background="#f7f8fb")
-        style.configure("Header.TLabel", background="#f7f8fb", foreground="#1f2937", font=("Arial", 22, "bold"))
+        style.configure("Header.TLabel", background="#f7f8fb", foreground="#1f2937", font=("Arial", 24, "bold"))
         style.configure("Body.TLabel", background="#f7f8fb", foreground="#4b5563", font=("Arial", 11))
         style.configure("Status.TLabel", background="#eef2ff", foreground="#3730a3", font=("Arial", 10, "bold"))
         style.configure("Primary.TButton", font=("Arial", 12, "bold"), padding=(16, 10))
         style.configure("Secondary.TButton", font=("Arial", 10), padding=(10, 7))
+        style.configure("Log.TLabel", background="#ffffff", foreground="#111827", font=("Arial", 11))
+        style.configure("TCheckbutton", background="#f7f8fb", font=("Arial", 10))
+        style.configure("TProgressbar", thickness=16)
 
     def build_ui(self):
         main_frame = ttk.Frame(self.root, padding=24)
@@ -110,25 +135,64 @@ class FileOrganizerApp:
 
         subtitle = ttk.Label(
             main_frame,
-            text="Choose a folder, then organize files into Images, Documents, Videos, Music, Code, Apps and more.",
+            text="Choose a folder and destination, then organize files by category. Enable recursive scan or dry run as needed.",
             style="Body.TLabel",
-            wraplength=640,
+            wraplength=760,
         )
-        subtitle.pack(anchor="w", pady=(6, 22))
+        subtitle.pack(anchor="w", pady=(6, 20))
 
-        folder_frame = ttk.Frame(main_frame)
-        folder_frame.pack(fill="x")
+        source_frame = ttk.Frame(main_frame)
+        source_frame.pack(fill="x", pady=(0, 12))
 
-        folder_entry = ttk.Entry(folder_frame, textvariable=self.folder_var, font=("Arial", 11))
-        folder_entry.pack(side="left", fill="x", expand=True, ipady=7)
+        source_label = ttk.Label(source_frame, text="Source folder:", style="Body.TLabel")
+        source_label.pack(anchor="w", pady=(0, 4))
 
-        browse_button = ttk.Button(
-            folder_frame,
+        source_entry = ttk.Entry(source_frame, textvariable=self.folder_var, font=("Arial", 11))
+        source_entry.pack(side="left", fill="x", expand=True, ipady=7)
+
+        browse_source_button = ttk.Button(
+            source_frame,
             text="Browse",
             style="Secondary.TButton",
             command=self.choose_folder,
         )
-        browse_button.pack(side="left", padx=(10, 0))
+        browse_source_button.pack(side="left", padx=(10, 0))
+
+        destination_frame = ttk.Frame(main_frame)
+        destination_frame.pack(fill="x", pady=(0, 18))
+
+        destination_label = ttk.Label(destination_frame, text="Destination folder:", style="Body.TLabel")
+        destination_label.pack(anchor="w", pady=(0, 4))
+
+        destination_entry = ttk.Entry(destination_frame, textvariable=self.destination_var, font=("Arial", 11))
+        destination_entry.pack(side="left", fill="x", expand=True, ipady=7)
+
+        browse_destination_button = ttk.Button(
+            destination_frame,
+            text="Browse",
+            style="Secondary.TButton",
+            command=self.choose_destination,
+        )
+        browse_destination_button.pack(side="left", padx=(10, 0))
+
+        options_frame = ttk.Frame(main_frame)
+        options_frame.pack(fill="x", pady=(0, 8))
+
+        recursive_checkbox = ttk.Checkbutton(
+            options_frame,
+            text="Recursive scan",
+            variable=self.recursive_var,
+            style="TCheckbutton",
+        )
+        recursive_checkbox.pack(side="left")
+
+        dry_run_checkbox = ttk.Checkbutton(
+            options_frame,
+            text="Dry run (no files moved)",
+            variable=self.dry_run_var,
+            style="TCheckbutton",
+        )
+        dry_run_checkbox.pack(side="left", padx=(28, 0))
 
         organize_button = ttk.Button(
             main_frame,
@@ -136,17 +200,24 @@ class FileOrganizerApp:
             style="Primary.TButton",
             command=self.organize_selected_folder,
         )
-        organize_button.pack(anchor="w", pady=(20, 18))
+        organize_button.pack(anchor="w", pady=(8, 18))
 
         status_label = ttk.Label(main_frame, textvariable=self.status_var, style="Status.TLabel", padding=10)
-        status_label.pack(fill="x", pady=(0, 14))
+        status_label.pack(fill="x", pady=(0, 12))
+
+        progress = ttk.Progressbar(main_frame, orient="horizontal", mode="determinate", variable=tk.DoubleVar(value=0))
+        progress.pack(fill="x", pady=(0, 10))
+        self.progress_bar = progress
+
+        self.summary_label = ttk.Label(main_frame, textvariable=self.summary_var, style="Body.TLabel")
+        self.summary_label.pack(anchor="w", pady=(0, 12))
 
         log_frame = ttk.Frame(main_frame)
         log_frame.pack(fill="both", expand=True)
 
         self.log_box = tk.Text(
             log_frame,
-            height=12,
+            height=14,
             wrap="word",
             bg="#ffffff",
             fg="#111827",
@@ -166,38 +237,72 @@ class FileOrganizerApp:
         folder = filedialog.askdirectory(initialdir=self.folder_var.get() or DEFAULT_SOURCE_FOLDER)
         if folder:
             self.folder_var.set(folder)
-            self.status_var.set("Folder selected")
-            self.write_log(f"Selected: {folder}")
+            self.status_var.set("Source folder selected")
+            self.write_log(f"Source: {folder}")
+
+    def choose_destination(self):
+        folder = filedialog.askdirectory(initialdir=self.destination_var.get() or DEFAULT_SOURCE_FOLDER)
+        if folder:
+            self.destination_var.set(folder)
+            self.status_var.set("Destination folder selected")
+            self.write_log(f"Destination: {folder}")
 
     def organize_selected_folder(self):
-        folder = self.folder_var.get().strip()
+        source = self.folder_var.get().strip()
+        destination = self.destination_var.get().strip() or source
+        recursive = self.recursive_var.get()
+        dry_run = self.dry_run_var.get()
+
         self.log_box.delete("1.0", "end")
         self.status_var.set("Organizing...")
+        self.summary_var.set("")
+        self.progress_bar['value'] = 0
         self.root.update_idletasks()
 
         try:
-            moved_files, errors = organize_folder(folder)
-        except (FileNotFoundError, PermissionError, OSError) as error:
+            moved_files, errors = organize_folder(
+                source_folder=source,
+                destination_folder=destination,
+                recursive=recursive,
+                dry_run=dry_run,
+            )
+        except (FileNotFoundError, PermissionError, ValueError, OSError) as error:
             self.status_var.set("Could not organize folder")
             messagebox.showerror("Error", str(error))
             self.write_log(f"Error: {error}")
             return
 
-        for original_name, target_folder, final_name in moved_files:
-            if original_name == final_name:
-                self.write_log(f"Moved: {original_name} -> {target_folder}")
+        total = len(moved_files) + len(errors)
+        for index, (original, category, final_name) in enumerate(moved_files, start=1):
+            if original.endswith(final_name):
+                self.write_log(f"Moved: {Path(original).name} -> {category}")
             else:
-                self.write_log(f"Moved: {original_name} -> {target_folder}/{final_name}")
+                self.write_log(f"Moved: {Path(original).name} -> {category}/{final_name}")
+            self.progress_bar['value'] = int(index / max(total, 1) * 100)
+            self.root.update_idletasks()
 
-        for filename, error in errors:
-            self.write_log(f"Failed: {filename} ({error})")
+        for index, (filename, error) in enumerate(errors, start=len(moved_files) + 1):
+            self.write_log(f"Failed: {Path(filename).name} ({error})")
+            self.progress_bar['value'] = int(index / max(total, 1) * 100)
+            self.root.update_idletasks()
 
+        summary_parts = []
         if moved_files:
+            summary_parts.append(f"Organized {len(moved_files)} file(s)")
+        if errors:
+            summary_parts.append(f"{len(errors)} failed")
+
+        self.summary_var.set(". ".join(summary_parts))
+
+        if dry_run:
+            self.status_var.set("Dry run complete.")
+            messagebox.showinfo("Dry Run", f"Found {len(moved_files)} file(s) that would be organized.")
+        elif moved_files:
             self.status_var.set(f"Done. Organized {len(moved_files)} file(s).")
             messagebox.showinfo("Complete", f"Organized {len(moved_files)} file(s).")
         else:
             self.status_var.set("No files to organize.")
-            self.write_log("No files found in the selected folder.")
+            self.write_log("No files found for organization.")
 
         if errors:
             self.write_log(f"\n{len(errors)} file(s) could not be moved.")
